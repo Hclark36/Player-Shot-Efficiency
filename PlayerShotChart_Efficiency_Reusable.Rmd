@@ -1,0 +1,2258 @@
+---
+title: "Player Shot Chart"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+## Project question
+
+How has Cason Wallace's shot selection changed, and where does
+his shooting outperform a league-wide baseline?
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE
+)
+```
+
+## Settings
+
+
+```{r settings}
+player_id <- 1630202
+player_name <- "Payton Pritchard"
+training_year <- 2024L
+validation_year <- 2025L
+evaluation_year <- 2026L
+bootstrap_repetitions <- 5000L
+bootstrap_seed <- 2026L
+# ZIP files use ending years; the third season uses a separate source.
+season_years <- c(training_year, validation_year)
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+```
+## Downloading and reading league-wide shots
+Keeping all players' shots because our eventual model needs
+a league-wide comparison.
+
+
+```{r load-data}
+load_shot_season <- function(year) {
+
+  dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+
+  zip_name <- paste0("NBA_", year, "_Shots.csv.zip")
+  zip_path <- file.path("data/raw", zip_name)
+
+  url <- paste0(
+    "https://raw.githubusercontent.com/",
+    "DomSamangy/NBA_Shots_04_25/main/",
+    zip_name
+  )
+
+  # Download only if the ZIP is not already saved.
+  if (!file.exists(zip_path)) {
+
+    message("Downloading season ending in ", year)
+
+    previous_timeout <- getOption("timeout")
+    options(timeout = max(300, previous_timeout))
+    on.exit(options(timeout = previous_timeout), add = TRUE)
+
+    tryCatch(
+      download.file(
+        url = url,
+        destfile = zip_path,
+        mode = "wb",
+        method = "libcurl"
+      ),
+      error = function(e) {
+        if (file.exists(zip_path)) {
+          unlink(zip_path)
+        }
+        stop("Download failed: ", conditionMessage(e))
+      }
+    )
+  }
+
+  # Find the season CSV, excluding Mac metadata.
+  contents <- unzip(zip_path, list = TRUE)
+
+  csv_files <- contents$Name[
+    grepl("\\.csv$", contents$Name, ignore.case = TRUE) &
+      !grepl("(^|/)__MACOSX/|(^|/)\\._", contents$Name)
+  ]
+
+  expected_name <- paste0("NBA_", year, "_Shots.csv")
+
+  selected_csv <- csv_files[
+    basename(csv_files) == expected_name
+  ]
+
+  if (length(selected_csv) != 1L) {
+    print(contents[, c("Name", "Length")])
+    stop("Could not identify a unique season CSV.")
+  }
+
+  # Extract the CSV into a temporary folder.
+  extract_dir <- tempfile("nba_shots_")
+  dir.create(extract_dir)
+
+  on.exit(
+    unlink(extract_dir, recursive = TRUE),
+    add = TRUE
+  )
+
+  unzip(
+    zipfile = zip_path,
+    files = selected_csv[[1]],
+    exdir = extract_dir
+  )
+
+  csv_path <- file.path(extract_dir, selected_csv[[1]])
+
+  # Read from the extracted file—no connection cleanup needed.
+  data <- read.csv(
+    csv_path,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  names(data) <- toupper(trimws(names(data)))
+  data$SEASON_END_YEAR <- year
+
+  message("Loaded ", nrow(data), " league shots for ", year)
+
+  return(data)
+}
+
+# Load both seasons.
+season_data <- lapply(season_years, load_shot_season)
+
+# Create the individual season objects.
+shots_2024 <- season_data[[1]]
+shots_2025 <- season_data[[2]]
+
+# Remove position columns, which differ between the files.
+drop_columns <- c("POSITION_GROUP", "POSITION")
+
+shots_2024 <- shots_2024[
+  , !names(shots_2024) %in% drop_columns,
+  drop = FALSE
+]
+
+shots_2025 <- shots_2025[
+  , !names(shots_2025) %in% drop_columns,
+  drop = FALSE
+]
+
+# Check for any remaining column differences.
+if (!setequal(names(shots_2024), names(shots_2025))) {
+  print(setdiff(names(shots_2024), names(shots_2025)))
+  print(setdiff(names(shots_2025), names(shots_2024)))
+  stop("Other column differences remain.")
+}
+
+# Match column order.
+shots_2025 <- shots_2025[, names(shots_2024), drop = FALSE]
+
+# Combine the seasons.
+league_shots <- rbind(shots_2024, shots_2025)
+rownames(league_shots) <- NULL
+
+# Inspect the combined data.
+dim(league_shots)
+table(league_shots$SEASON_END_YEAR)
+```
+
+
+```{r load-third-season}
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+
+archive_path <- file.path(
+  "data/raw",
+  "nba_shotdetail_2025_26.parquet"
+)
+
+archive_url <- paste0(
+  "https://huggingface.co/datasets/",
+  "cdechoch/nba-data-archive/resolve/main/",
+  "per_season/shotdetail/2025.parquet"
+)
+
+if (!file.exists(archive_path)) {
+  download.file(
+    url = archive_url,
+    destfile = archive_path,
+    method = "libcurl",
+    mode = "wb"
+  )
+}
+
+shots_2026_archive <- as.data.frame(
+  arrow::read_parquet(archive_path)
+)
+
+# Confirm the file contains the requested regular season.
+stopifnot(
+  all(shots_2026_archive[["_season"]] == 2025),
+  all(shots_2026_archive[["_season_type"]] == "rg"),
+  all(shots_2026_archive$SHOT_ATTEMPTED_FLAG == 1)
+)
+
+players_2026_archive <- subset(
+  shots_2026_archive,
+  PLAYER_ID == as.integer(player_id)
+)
+
+cat("League attempts:", nrow(shots_2026_archive), "\n")
+cat("Players attempts:", nrow(players_2026_archive), "\n")
+
+with(
+  players_2026_archive,
+  table(SHOT_ZONE_BASIC, SHOT_MADE_FLAG)
+)
+```
+
+
+```{r inspect-league}
+dim(league_shots)
+
+names(league_shots)
+
+head(league_shots)
+
+str(league_shots)
+
+```
+
+## 4. Select Wallace's shots
+
+
+```{r select-player}
+required_columns <- c("PLAYER_ID", "PLAYER_NAME")
+
+if (!all(required_columns %in% names(league_shots))) {
+  stop("Missing player columns. Inspect names(league_shots).")
+}
+
+player_rows <- (
+  as.character(league_shots$PLAYER_ID) == player_id
+)
+
+# Exclude rows with missing IDs.
+player_rows[is.na(player_rows)] <- FALSE
+
+player_shots <- league_shots[player_rows, , drop = FALSE]
+
+if (nrow(player_shots) == 0L) {
+  stop("No shots found for the selected player.")
+}
+
+unique(player_shots$PLAYER_NAME)
+
+table(player_shots$SEASON_END_YEAR)
+
+head(player_shots)
+```
+
+## 5. Save the combined data
+
+
+```{r save-data}
+saveRDS(
+  league_shots,
+  file = "data/raw/league_shots_2024_2025.rds"
+)
+
+saveRDS(
+  player_shots,
+  file = paste0("data/raw/", player_id, "_shots_2024_2025.rds")
+)
+
+cat("League shot rows:", nrow(league_shots), "\n")
+cat("Player shot rows:", nrow(player_shots), "\n")
+
+unique(player_shots$PLAYER_NAME)
+str(player_shots)
+```
+
+# Cleaning league wide data
+
+
+```{r clean-shots}
+# Working on a copy
+shots_clean <- league_shots
+
+# Converting dates and shot outcomes
+shots_clean$game_date <- as.Date(
+  shots_clean$GAME_DATE,
+  format = "%m-%d-%Y"
+)
+
+shots_clean$made <- as.integer(shots_clean$SHOT_MADE)
+
+# Assigning each shot a point value
+shots_clean$shot_value <- NA_integer_
+
+shots_clean$shot_value[
+  shots_clean$SHOT_TYPE %in% "2PT Field Goal"
+] <- 2L
+
+shots_clean$shot_value[
+  shots_clean$SHOT_TYPE %in% "3PT Field Goal"
+] <- 3L
+
+# Points scored from the field goal attempt
+shots_clean$points <- (
+  shots_clean$made * shots_clean$shot_value
+)
+
+# Flagging rows for missing essential information
+valid_rows <- complete.cases(
+  shots_clean[, c(
+    "PLAYER_ID", "GAME_ID", "game_date",
+    "made", "shot_value", "SHOT_DISTANCE",
+    "LOC_X", "LOC_Y", "BASIC_ZONE"
+  )]
+)
+
+cat("Rows missing essential data:", sum(!valid_rows), "\n")
+
+shots_clean <- shots_clean[valid_rows, , drop = FALSE]
+
+# Checking the outcome
+stopifnot(
+  all(shots_clean$made %in% c(0L, 1L)),
+  all(shots_clean$SHOT_DISTANCE >= 0)
+)
+
+# Selecting chosen player from cleaned dataset
+player_clean <- shots_clean[
+  as.character(shots_clean$PLAYER_ID) == player_id,
+  ,
+  drop = FALSE
+]
+
+# Summarizing shooting by season and shot value
+shooting_summary <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(player_clean)),
+    makes = player_clean$made,
+    points = player_clean$points
+  ),
+  by = list(
+    season = player_clean$SEASON_2,
+    shot_value = player_clean$shot_value
+  ),
+  FUN = sum
+)
+
+shooting_summary$fg_pct <- round(
+  100 * shooting_summary$makes / shooting_summary$attempts,
+  1
+)
+
+shooting_summary$points_per_attempt <- round(
+  shooting_summary$points / shooting_summary$attempts,
+  3
+)
+
+shooting_summary
+```
+
+## Useful Follow Up Question
+
+With Cason Wallace's three-point percentage fell by 6.3 percentage points, while his two-point percentage stayed fairly similar, and threes also fell from 52.9% to 42.5% of his attempts. Did his shot locations change, or did he make fewer shots from similar locations?
+
+# His shooting zones
+
+
+```{r zone-summary}
+zone_summary <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(player_clean)),
+    makes = player_clean$made
+  ),
+  by = list(
+    season = player_clean$SEASON_2,
+    zone = player_clean$BASIC_ZONE
+  ),
+  FUN = sum
+)
+
+zone_summary$fg_pct <- round(
+  100 * zone_summary$makes / zone_summary$attempts,
+  1
+)
+
+# Percentage of each season's attempts taken in each zone
+season_attempts <- ave(
+  zone_summary$attempts,
+  zone_summary$season,
+  FUN = sum
+)
+
+zone_summary$attempt_share_pct <- round(
+  100 * zone_summary$attempts / season_attempts,
+  1
+)
+
+zone_summary <- zone_summary[
+  order(zone_summary$zone, zone_summary$season),
+]
+
+rownames(zone_summary) <- NULL
+
+knitr::kable(
+  zone_summary,
+  col.names = c(
+    "Season", "Zone", "Attempts", "Makes",
+    "FG%", "Share of Attempts (%)"
+  )
+)
+```
+
+Cason Wallace took a larger share of his shots inside the paint, while his lower three-point percentage was concentrated in corner attempts.
+
+
+```{r baseline-model}
+# Excluding the selected player
+other_players <- shots_clean[
+  as.character(shots_clean$PLAYER_ID) != player_id,
+  ,
+  drop = FALSE
+]
+
+# Train on earlier season and test on later season
+train_shots <- other_players[
+  other_players$SEASON_END_YEAR == 2024,
+  ,
+  drop = FALSE
+]
+
+test_shots <- other_players[
+  other_players$SEASON_END_YEAR == 2025,
+  ,
+  drop = FALSE
+]
+
+# Categorical variable gives each zone its own baseline
+train_shots$zone <- factor(train_shots$BASIC_ZONE)
+
+# Checking test zones absent from training
+unseen_zones <- setdiff(
+  unique(test_shots$BASIC_ZONE),
+  levels(train_shots$zone)
+)
+
+if (length(unseen_zones) > 0L) {
+  stop("Test data contains unseen zones: ",
+       paste(unseen_zones, collapse = ", "))
+}
+
+test_shots$zone <- factor(
+  test_shots$BASIC_ZONE,
+  levels = levels(train_shots$zone)
+)
+
+# Logistic Regression model
+# Uses court only
+zone_model <- glm(
+  made~zone,
+  data = train_shots,
+  family = binomial()
+)
+
+# Predicting probabilities for later season
+test_shots$expected_make <- predict(
+  zone_model,
+  newdata = test_shots,
+  type = "response"
+)
+
+# Comparing against a simple constant-probability model
+constant_probability <- mean(train_shots$made)
+
+log_loss <- function(actual, predicted) {
+  p <- pmin(pmax(predicted, 1e-15), 1 - 1e-15)
+  
+  -mean(
+    actual * log(p) +
+      (1 - actual) * log(1-p)
+  )
+}
+
+model_results <- data.frame(
+  model = c("Training league FG% only", "Court-zone model"),
+  log_loss = c(
+    log_loss(
+      test_shots$made,
+      rep(constant_probability, nrow(test_shots))
+    ),
+    log_loss(
+      test_shots$made,
+      test_shots$expected_make
+    )
+  ),
+  brier_score = c(
+    mean((test_shots$made - constant_probability)^2),
+    mean((test_shots$made - test_shots$expected_make)^2)
+  )
+)
+
+knitr::kable(model_results, digits = 4)
+```
+
+## Calibration
+
+
+```{r zone-calibration}
+calibration <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(test_shots)),
+    actual_makes = test_shots$made,
+    expected_makes = test_shots$expected_make
+  ),
+  by = list(zone = test_shots$BASIC_ZONE),
+  FUN = sum
+)
+
+calibration$actual_fg_pct <- (
+  100 * calibration$actual_makes / calibration$attempts
+)
+
+calibration$expected_fg_pct <- (
+  100 * calibration$expected_makes / calibration$attempts
+)
+
+# Positive: the model underestimated shooting.
+# Negative: the model overestimated shooting.
+calibration$gap_pp <- (
+  calibration$actual_fg_pct - calibration$expected_fg_pct
+)
+
+knitr::kable(
+  calibration[, c(
+    "zone", "attempts",
+    "actual_fg_pct", "expected_fg_pct", "gap_pp"
+  )],
+  digits = 2,
+  col.names = c(
+    "Zone", "Attempts", "Actual FG%",
+    "Expected FG%", "Gap (percentage points)"
+  )
+)
+```
+
+
+```{r player-vs-expected}
+# Matching the zone used when training the model
+player_clean$zone <- factor(
+  player_clean$BASIC_ZONE,
+  levels = levels(train_shots$zone)
+)
+
+if (anyNA(player_clean$zone)) {
+  stop("A player shot zone was not present in training.")
+}
+
+# Applying the league model to selected players shots
+player_clean$expected_make <- predict(
+  zone_model,
+  newdata = player_clean,
+  type = "response"
+)
+
+# Summarize actual and expected
+player_evaluation <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(player_clean)),
+    actual_makes = player_clean$made,
+    expected_makes = player_clean$expected_make
+  ),
+  by = list(
+    season = player_clean$SEASON_2,
+    zone = player_clean$BASIC_ZONE
+  ),
+  FUN = sum
+)
+
+player_evaluation$actual_fg_pct <- (
+  100 * player_evaluation$actual_makes /
+    player_evaluation$attempts
+)
+
+player_evaluation$expected_fg_pct <- (
+  100 * player_evaluation$expected_makes /
+    player_evaluation$attempts
+)
+
+player_evaluation$gap_pp <- (
+  player_evaluation$actual_fg_pct -
+    player_evaluation$expected_fg_pct
+)
+
+player_evaluation$makes_above_expected <- (
+  player_evaluation$actual_makes -
+    player_evaluation$expected_makes
+)
+
+player_evaluation <- player_evaluation[
+  order(player_evaluation$zone, player_evaluation$season),
+]
+
+rownames(player_evaluation) <- NULL
+
+knitr::kable(
+  player_evaluation[, c(
+    "season", "zone", "attempts",
+    "actual_fg_pct", "expected_fg_pct",
+    "gap_pp", "makes_above_expected"
+  )],
+  digits = 2,
+  col.names = c(
+    "Season", "Zone", "Attempts",
+    "Actual FG%", "Expected FG%",
+    "Gap (pp)", "Makes Above Expected"
+  )
+)
+```
+
+## Shooting uncertainty
+
+
+```{r shooting-uncertainty}
+# Wilson intervals for a proportion
+
+wilson_interval <- function(makes, attempts, confidence = 0.95) {
+  
+  z <- qnorm(1-(1-confidence) / 2)
+  p <- makes / attempts
+  
+  denominator <- 1+z^2 / attempts
+  
+  center <- (
+    p+z^2 / (2 * attempts)
+  ) / denominator
+  
+  half_width <- (
+    z * sqrt(
+      p* (1-p) / attempts +
+        z^2 / (4 * attempts^2)
+    )
+  ) / denominator
+  
+  data.frame(
+    lower = center - half_width,
+    upper = center + half_width
+  )
+}
+
+intervals <- wilson_interval(
+  makes = player_evaluation$actual_makes,
+  attempts = player_evaluation$attempts
+)
+
+player_evaluation$fg_lower_pct <- 100*intervals$lower
+player_evaluation$fg_upper_pct <- 100*intervals$upper
+
+# subtracting the fixed benchmark
+player_evaluation$gap_lower_pp <- (
+  player_evaluation$fg_lower_pct -
+    player_evaluation$expected_fg_pct
+)
+
+player_evaluation$gap_upper_pp <- (
+  player_evaluation$fg_upper_pct -
+    player_evaluation$expected_fg_pct
+)
+
+knitr::kable(
+  player_evaluation[, c(
+    "season", "zone", "attempts",
+    "actual_fg_pct", "expected_fg_pct",
+    "gap_pp", "gap_lower_pp", "gap_upper_pp"
+  )],
+  digits = 2,
+  col.names = c(
+    "Season", "Zone", "Attempts",
+    "Actual FG%", "Expected FG%",
+    "Gap (pp)", "95% Lower Gap", "95% Upper Gap"
+  )
+)
+```
+
+
+```{r corner-season-change}
+# Select left- and right-corner threes.
+corner_shots <- player_clean[
+  player_clean$BASIC_ZONE %in%
+    c("Left Corner 3", "Right Corner 3"),
+  ,
+  drop = FALSE
+]
+
+# Summarize attempts and makes by season.
+corner_summary <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(corner_shots)),
+    makes = corner_shots$made
+  ),
+  by = list(season = corner_shots$SEASON_2),
+  FUN = sum
+)
+
+corner_summary$fg_pct <- (
+  100 * corner_summary$makes / corner_summary$attempts
+)
+
+knitr::kable(corner_summary, digits = 2)
+
+# Separate the two seasons.
+earlier <- corner_shots[
+  corner_shots$SEASON_END_YEAR == 2024,
+  ,
+  drop = FALSE
+]
+
+later <- corner_shots[
+  corner_shots$SEASON_END_YEAR == 2025,
+  ,
+  drop = FALSE
+]
+
+# Resample whole games, preserving shots within each game.
+# Each row stores one game's corner attempts and makes.
+summarize_games <- function(data) {
+  aggregate(
+    cbind(
+      attempts = rep(1L, nrow(data)),
+      makes = data$made
+    ),
+    by = list(game_id = data$GAME_ID),
+    FUN = sum
+  )
+}
+
+earlier_games <- summarize_games(earlier)
+later_games <- summarize_games(later)
+
+bootstrap_fg <- function(game_data) {
+
+  sampled_rows <- sample.int(
+    nrow(game_data),
+    size = nrow(game_data),
+    replace = TRUE
+  )
+
+  sampled_games <- game_data[sampled_rows, , drop = FALSE]
+
+  sum(sampled_games$makes) / sum(sampled_games$attempts)
+}
+
+# Repeat the comparison with resampled games.
+set.seed(bootstrap_seed)
+bootstrap_repetitions <- 5000
+
+bootstrap_changes <- replicate(
+  bootstrap_repetitions,
+  100 * (
+    bootstrap_fg(later_games) -
+      bootstrap_fg(earlier_games)
+  )
+)
+
+observed_change <- 100 * (
+  mean(later$made) - mean(earlier$made)
+)
+
+change_interval <- quantile(
+  bootstrap_changes,
+  probs = c(0.025, 0.975),
+  names = FALSE
+)
+
+corner_change <- data.frame(
+  comparison = "2024-25 minus 2023-24",
+  change_pp = observed_change,
+  lower_95_pp = change_interval[1],
+  upper_95_pp = change_interval[2]
+)
+
+knitr::kable(corner_change, digits = 2)
+```
+
+## Distance model
+
+
+```{r distance-model}
+distance_model <- glm(
+  made ~ zone + splines::ns(SHOT_DISTANCE, df = 4),
+  data = train_shots,
+  family = binomial()
+)
+
+# Predicting on the same later season validation shots
+test_shots$expected_make_distance <- predict(
+  distance_model,
+  newdata = test_shots,
+  type = "response"
+)
+
+# Comparing all three models on identical shots
+distance_results <- data.frame(
+  model = c(
+    "Training league FG% only",
+    "Court-zone model",
+    "Zone + distance model"
+  ),
+
+  log_loss = c(
+    log_loss(
+      test_shots$made,
+      rep(constant_probability, nrow(test_shots))
+    ),
+    log_loss(
+      test_shots$made,
+      test_shots$expected_make
+    ),
+    log_loss(
+      test_shots$made,
+      test_shots$expected_make_distance
+    )
+  ),
+
+  brier_score = c(
+    mean((test_shots$made - constant_probability)^2),
+    mean((test_shots$made - test_shots$expected_make)^2),
+    mean(
+      (test_shots$made -
+         test_shots$expected_make_distance)^2
+    )
+  )
+)
+
+knitr::kable(distance_results, digits = 4)
+```
+
+## Shots by predicted probability
+
+
+```{r distance-calibration}
+# Group predictions into 10-percentage-point bands.
+probability_band <- cut(
+  test_shots$expected_make_distance,
+  breaks = seq(0, 1, by = 0.1),
+  include.lowest = TRUE,
+  right = FALSE
+)
+
+distance_calibration <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(test_shots)),
+    actual_makes = test_shots$made,
+    expected_makes = test_shots$expected_make_distance
+  ),
+  by = list(probability_band = probability_band),
+  FUN = sum
+)
+
+distance_calibration$actual_fg_pct <- (
+  100 * distance_calibration$actual_makes /
+    distance_calibration$attempts
+)
+
+distance_calibration$expected_fg_pct <- (
+  100 * distance_calibration$expected_makes /
+    distance_calibration$attempts
+)
+
+distance_calibration$gap_pp <- (
+  distance_calibration$actual_fg_pct -
+    distance_calibration$expected_fg_pct
+)
+
+knitr::kable(
+  distance_calibration[, c(
+    "probability_band", "attempts",
+    "actual_fg_pct", "expected_fg_pct", "gap_pp"
+  )],
+  digits = 2,
+  col.names = c(
+    "Predicted Probability Band", "Attempts",
+    "Actual FG%", "Average Predicted FG%", "Gap (pp)"
+  )
+)
+```
+The model tracks actual shooting reasonably closely in the bands containing most attempts. But the 10–20% band needs investigation: it predicted about 8.3 makes across 44 shots, while only one went in. The small sample adds uncertainty, but we shouldn’t dismiss that gap.
+
+## Inspecting the low bands
+
+
+```{r low-band-investigation}
+low_probability_shots <- test_shots[
+  test_shots$expected_make_distance >= 0.1 &
+    test_shots$expected_make_distance < 0.2,
+  ,
+  drop = FALSE
+]
+
+# Identify their court zones and outcomes.
+table(low_probability_shots$BASIC_ZONE)
+table(low_probability_shots$made)
+
+# Examine their distances.
+summary(low_probability_shots$SHOT_DISTANCE)
+
+# Inspect individual examples.
+knitr::kable(
+  head(
+    low_probability_shots[, c(
+      "PLAYER_NAME", "BASIC_ZONE", "SHOT_DISTANCE",
+      "QUARTER", "MINS_LEFT", "SECS_LEFT",
+      "made", "expected_make_distance"
+    )],
+    15
+  ),
+  digits = 3
+)
+
+# Does Wallace have any shots in this probability band?
+player_clean$expected_make_distance <- predict(
+  distance_model,
+  newdata = player_clean,
+  type = "response"
+)
+
+sum(
+  player_clean$expected_make_distance >= 0.1 &
+    player_clean$expected_make_distance < 0.2
+)
+```
+These examples point to very long, end-of-period attempts. Most shown are 42–47 feet away with 0–1 seconds remaining. The model assigns them roughly a 17–19% chance, which appears too optimistic for that context.
+One exception is Dončić’s attempt with 11:36 remaining. That could be an unusual shot or a data issue; we shouldn’t label every long attempt a buzzer heave.
+For our ordinary shooting evaluation, let’s define the scope as shots under 40 feet, excluding the Backcourt zone. That’s a practical cutoff—not an official definition of a heave. We’ll retain excluded shots separately and apply the same rule to training, validation, and Wallace.
+
+## Ordinary shooting evaluation
+
+
+```{r shot-scope}
+in_scope <- function(data) {
+  data$SHOT_DISTANCE < 40 &
+    data$BASIC_ZONE != "Backcourt"
+}
+```
+
+
+```{r standardize-third-season}
+shots_2026_clean <- data.frame(
+  SEASON_2 = "2025-26",
+  SEASON_END_YEAR = 2026L,
+  GAME_ID = shots_2026_archive$GAME_ID,
+  GAME_EVENT_ID = shots_2026_archive$GAME_EVENT_ID,
+  PLAYER_ID = shots_2026_archive$PLAYER_ID,
+  PLAYER_NAME = shots_2026_archive$PLAYER_NAME,
+  TEAM_ID = shots_2026_archive$TEAM_ID,
+  TEAM_NAME = shots_2026_archive$TEAM_NAME,
+
+  game_date = as.Date(
+    as.character(shots_2026_archive$GAME_DATE),
+    format = "%Y%m%d"
+  ),
+
+  BASIC_ZONE = shots_2026_archive$SHOT_ZONE_BASIC,
+  SHOT_TYPE = shots_2026_archive$SHOT_TYPE,
+  ACTION_TYPE = shots_2026_archive$ACTION_TYPE,
+  SHOT_DISTANCE = shots_2026_archive$SHOT_DISTANCE,
+
+  # Match the older dataset's coordinates:
+  # feet, with the basket at (0, 5.25).
+  LOC_X = shots_2026_archive$LOC_X / 10,
+  LOC_Y = shots_2026_archive$LOC_Y / 10 + 5.25,
+
+  QUARTER = shots_2026_archive$PERIOD,
+  MINS_LEFT = shots_2026_archive$MINUTES_REMAINING,
+  SECS_LEFT = shots_2026_archive$SECONDS_REMAINING,
+
+  made = as.integer(shots_2026_archive$SHOT_MADE_FLAG),
+  stringsAsFactors = FALSE
+)
+
+# Translate shot type into its point value.
+shots_2026_clean$shot_value <- NA_integer_
+
+shots_2026_clean$shot_value[
+  shots_2026_clean$SHOT_TYPE == "2PT Field Goal"
+] <- 2L
+
+shots_2026_clean$shot_value[
+  shots_2026_clean$SHOT_TYPE == "3PT Field Goal"
+] <- 3L
+
+shots_2026_clean$points <- with(
+  shots_2026_clean,
+  made * shot_value
+)
+
+# Check the fields needed for analysis.
+essential_columns <- c(
+  "GAME_ID", "GAME_EVENT_ID", "PLAYER_ID", "game_date",
+  "BASIC_ZONE", "SHOT_DISTANCE", "LOC_X", "LOC_Y",
+  "made", "shot_value"
+)
+
+stopifnot(
+  all(complete.cases(
+    shots_2026_clean[, essential_columns, drop = FALSE]
+  )),
+  all(shots_2026_clean$made %in% c(0L, 1L)),
+  all(shots_2026_clean$SHOT_DISTANCE >= 0),
+  !anyDuplicated(
+    shots_2026_clean[, c("GAME_ID", "GAME_EVENT_ID")]
+  )
+)
+
+# Apply the same shot exclusions used in earlier seasons.
+shots_2026_ordinary <- shots_2026_clean[
+  in_scope(shots_2026_clean),
+  ,
+  drop = FALSE
+]
+
+player_2026_ordinary <- subset(
+  shots_2026_ordinary,
+  PLAYER_ID == as.integer(player_id)
+)
+
+cat(
+  "League retained:", nrow(shots_2026_ordinary),
+  "| Excluded:",
+  nrow(shots_2026_clean) - nrow(shots_2026_ordinary),
+  "\n"
+)
+
+cat(
+  "Player retained:", nrow(player_2026_ordinary),
+  "| Excluded:",
+  sum(shots_2026_clean$PLAYER_ID == as.integer(player_id)) -
+    nrow(player_2026_ordinary),
+  "\n"
+)
+```
+
+## 3. Inspect the league data
+
+
+```{r compare-season-coverage}
+check_long_shots <- function(data, label) {
+
+  coordinate_distance <- with(
+    data,
+    sqrt(LOC_X^2 + (LOC_Y - 5.25)^2)
+  )
+
+  data.frame(
+    season = label,
+    attempts = nrow(data),
+    backcourt = sum(
+      data$BASIC_ZONE == "Backcourt",
+      na.rm = TRUE
+    ),
+    reported_40_plus = sum(
+      data$SHOT_DISTANCE >= 40,
+      na.rm = TRUE
+    ),
+    coordinates_40_plus = sum(
+      coordinate_distance >= 40,
+      na.rm = TRUE
+    ),
+    zero_distance_threes = sum(
+      data$shot_value == 3 & data$SHOT_DISTANCE == 0,
+      na.rm = TRUE
+    )
+  )
+}
+
+coverage_check <- rbind(
+  check_long_shots(
+    subset(shots_clean, SEASON_END_YEAR == 2024),
+    "2023-24"
+  ),
+  check_long_shots(
+    subset(shots_clean, SEASON_END_YEAR == 2025),
+    "2024-25"
+  ),
+  check_long_shots(
+    shots_2026_clean,
+    "2025-26"
+  )
+)
+
+knitr::kable(coverage_check, row.names = FALSE)
+```
+
+
+```{r reusable-data-selection}
+analysis_columns <- c(
+  "SEASON_2", "SEASON_END_YEAR", "GAME_ID", "PLAYER_ID", "PLAYER_NAME",
+  "BASIC_ZONE", "SHOT_DISTANCE", "LOC_X", "LOC_Y", "made", "shot_value", "points"
+)
+all_season_shots <- rbind(
+  shots_clean[, analysis_columns, drop = FALSE],
+  shots_2026_clean[, analysis_columns, drop = FALSE]
+)
+all_ordinary_shots <- all_season_shots[in_scope(all_season_shots), , drop = FALSE]
+selected_player_shots <- subset(all_ordinary_shots, PLAYER_ID == player_id)
+if (nrow(selected_player_shots) == 0L) stop("No shots found for selected player ID.")
+found_names <- unique(selected_player_shots$PLAYER_NAME)
+if (!all(found_names == player_name)) {
+  stop("Player ID returned: ", paste(found_names, collapse = ", "),
+       ". Check player_id and player_name.")
+}
+other_players <- subset(all_ordinary_shots, PLAYER_ID != player_id)
+train_ordinary <- subset(other_players, SEASON_END_YEAR == training_year)
+validation_ordinary <- subset(other_players, SEASON_END_YEAR == validation_year)
+final_test_shots <- subset(other_players, SEASON_END_YEAR == evaluation_year)
+stopifnot(nrow(train_ordinary) > 0L, nrow(validation_ordinary) > 0L,
+          nrow(final_test_shots) > 0L)
+train_ordinary$zone <- factor(train_ordinary$BASIC_ZONE)
+training_zones <- levels(train_ordinary$zone)
+assign_training_zones <- function(data) {
+  unknown_zones <- setdiff(unique(data$BASIC_ZONE), training_zones)
+  if (length(unknown_zones) > 0L) {
+    stop("Zones absent from training: ", paste(unknown_zones, collapse = ", "))
+  }
+  data$zone <- factor(data$BASIC_ZONE, levels = training_zones)
+  data
+}
+validation_ordinary <- assign_training_zones(validation_ordinary)
+final_test_shots <- assign_training_zones(final_test_shots)
+selected_player_shots <- assign_training_zones(selected_player_shots)
+# Preserve the original two-season sections.
+player_ordinary <- subset(selected_player_shots,
+                         SEASON_END_YEAR %in% c(training_year, validation_year))
+print(table(selected_player_shots$SEASON_2))
+```
+
+
+```{r ordinary-shot-model}
+# Refit both models on the same restricted training data.
+zone_model_ordinary <- glm(
+  made ~ zone,
+  data = train_ordinary,
+  family = binomial()
+)
+
+distance_model_ordinary <- glm(
+  made ~ zone + splines::ns(SHOT_DISTANCE, df = 4),
+  data = train_ordinary,
+  family = binomial()
+)
+
+validation_ordinary$p_zone <- predict(
+  zone_model_ordinary,
+  newdata = validation_ordinary,
+  type = "response"
+)
+
+validation_ordinary$p_distance <- predict(
+  distance_model_ordinary,
+  newdata = validation_ordinary,
+  type = "response"
+)
+
+ordinary_results <- data.frame(
+  model = c("Zone only", "Zone + distance"),
+  log_loss = c(
+    log_loss(validation_ordinary$made, validation_ordinary$p_zone),
+    log_loss(validation_ordinary$made, validation_ordinary$p_distance)
+  ),
+  brier_score = c(
+    mean((validation_ordinary$made - validation_ordinary$p_zone)^2),
+    mean((validation_ordinary$made - validation_ordinary$p_distance)^2)
+  )
+)
+
+knitr::kable(ordinary_results, digits = 4)
+```
+## Ordinary Calibration
+
+
+```{r reusable-player-predictions}
+selected_player_shots$p_distance <- predict(
+  distance_model_ordinary, newdata = selected_player_shots, type = "response"
+)
+stopifnot(all(is.finite(selected_player_shots$p_distance)))
+selected_player_shots$expected_points <- with(selected_player_shots,
+                                             shot_value * p_distance)
+selected_player_shots$attempts <- 1L
+player_three_seasons <- selected_player_shots
+```
+
+
+```{r ordinary-calibration}
+probability_band <- cut(
+  validation_ordinary$p_distance,
+  breaks = seq(0, 1, by = 0.1),
+  include.lowest = TRUE,
+  right = FALSE
+)
+
+ordinary_calibration <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(validation_ordinary)),
+    actual_makes = validation_ordinary$made,
+    expected_makes = validation_ordinary$p_distance
+  ),
+  by = list(probability_band = probability_band),
+  FUN = sum
+)
+
+ordinary_calibration$actual_fg_pct <- (
+  100 * ordinary_calibration$actual_makes /
+    ordinary_calibration$attempts
+)
+
+ordinary_calibration$expected_fg_pct <- (
+  100 * ordinary_calibration$expected_makes /
+    ordinary_calibration$attempts
+)
+
+ordinary_calibration$gap_pp <- (
+  ordinary_calibration$actual_fg_pct -
+    ordinary_calibration$expected_fg_pct
+)
+
+knitr::kable(
+  ordinary_calibration[, c(
+    "probability_band", "attempts",
+    "actual_fg_pct", "expected_fg_pct", "gap_pp"
+  )],
+  digits = 2,
+  col.names = c(
+    "Probability Band", "Attempts",
+    "Actual FG%", "Predicted FG%", "Gap (pp)"
+  )
+)
+
+# Show how many shots the scope rule excluded.
+
+print(ordinary_calibration)
+```
+
+The revised model is reasonably calibrated in the bands containing most shots, but it still overpredicts the lowest-probability group
+
+## Player distance evaluation
+
+
+```{r evaluate-third-season}
+# Exclude Cason, matching our earlier league evaluation.
+final_test_shots <- subset(
+  shots_2026_ordinary,
+  PLAYER_ID != as.integer(player_id)
+)
+
+# Confirm that the models recognize every zone.
+training_zones <- levels(train_ordinary$zone)
+
+unknown_zones <- setdiff(
+  unique(final_test_shots$BASIC_ZONE),
+  training_zones
+)
+
+if (length(unknown_zones) > 0L) {
+  stop(
+    "Unrecognized zones: ",
+    paste(unknown_zones, collapse = ", ")
+  )
+}
+
+final_test_shots$zone <- factor(
+  final_test_shots$BASIC_ZONE,
+  levels = training_zones
+)
+
+# Predict without refitting either model.
+final_test_shots$p_zone <- predict(
+  zone_model_ordinary,
+  newdata = final_test_shots,
+  type = "response"
+)
+
+final_test_shots$p_distance <- predict(
+  distance_model_ordinary,
+  newdata = final_test_shots,
+  type = "response"
+)
+
+stopifnot(
+  all(is.finite(final_test_shots$p_zone)),
+  all(is.finite(final_test_shots$p_distance))
+)
+
+# The baseline also uses only the original training season.
+training_fg_pct <- mean(train_ordinary$made)
+
+final_results <- data.frame(
+  model = c(
+    "Training league FG% only",
+    "Zone only",
+    "Zone + distance"
+  ),
+
+  log_loss = c(
+    log_loss(
+      final_test_shots$made,
+      rep(training_fg_pct, nrow(final_test_shots))
+    ),
+    log_loss(
+      final_test_shots$made,
+      final_test_shots$p_zone
+    ),
+    log_loss(
+      final_test_shots$made,
+      final_test_shots$p_distance
+    )
+  ),
+
+  brier_score = c(
+    mean((final_test_shots$made - training_fg_pct)^2),
+    mean((final_test_shots$made - final_test_shots$p_zone)^2),
+    mean((final_test_shots$made - final_test_shots$p_distance)^2)
+  )
+)
+
+knitr::kable(final_results, digits = 4, row.names = FALSE)
+```
+
+
+```{r player-distance-evaluation}
+player_ordinary$p_distance <- predict(
+  distance_model_ordinary,
+  newdata = player_ordinary,
+  type = "response"
+)
+
+player_ordinary$expected_points <- (
+  player_ordinary$shot_value * player_ordinary$p_distance
+)
+
+cat(
+  "Player attempts with predicted probability below 30%:",
+  sum(player_ordinary$p_distance < 0.3),
+  "\n"
+)
+
+distance_evaluation <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(player_ordinary)),
+    actual_makes = player_ordinary$made,
+    expected_makes = player_ordinary$p_distance,
+    actual_points = player_ordinary$points,
+    expected_points = player_ordinary$expected_points
+  ),
+  by = list(
+    season = player_ordinary$SEASON_2,
+    zone = player_ordinary$BASIC_ZONE
+  ),
+  FUN = sum
+)
+
+distance_evaluation$actual_fg_pct <- (
+  100 * distance_evaluation$actual_makes /
+    distance_evaluation$attempts
+)
+
+distance_evaluation$expected_fg_pct <- (
+  100 * distance_evaluation$expected_makes /
+    distance_evaluation$attempts
+)
+
+distance_evaluation$gap_pp <- (
+  distance_evaluation$actual_fg_pct -
+    distance_evaluation$expected_fg_pct
+)
+
+distance_evaluation$points_above_expected <- (
+  distance_evaluation$actual_points -
+    distance_evaluation$expected_points
+)
+
+distance_evaluation <- distance_evaluation[
+  order(distance_evaluation$zone, distance_evaluation$season),
+]
+
+rownames(distance_evaluation) <- NULL
+
+knitr::kable(
+  distance_evaluation[, c(
+    "season", "zone", "attempts",
+    "actual_fg_pct", "expected_fg_pct",
+    "gap_pp", "points_above_expected"
+  )],
+  digits = 2,
+  col.names = c(
+    "Season", "Zone", "Attempts",
+    "Actual FG%", "Expected FG%",
+    "Gap (pp)", "Points Above Expected"
+  )
+)
+```
+
+Cason Wallace's expected corner percentages barely changed between seasons. That suggests distance, as represented by this model, doesn’t explain much of the observed corner decline. Defender pressure, shot preparation, and random variation remain possible explanations.
+Also, −16.53 points above expected means his corner attempts produced 16.53 fewer points than the model expected. It doesn’t mean he cost the team that many points or that another shot choice would have recovered them.
+
+## Players season shooting value
+
+
+```{r three-season-player-summary}
+# Add up attempts, actual points, and expected points by season.
+three_season_value <- aggregate(
+  cbind(
+    attempts,
+    actual_points = points,
+    expected_points
+  ) ~ SEASON_2,
+  data = player_three_seasons,
+  FUN = sum
+)
+
+three_season_value$actual_points_per_attempt <- with(
+  three_season_value,
+  actual_points / attempts
+)
+
+three_season_value$expected_points_per_attempt <- with(
+  three_season_value,
+  expected_points / attempts
+)
+
+three_season_value$points_above_expected_per_100 <- with(
+  three_season_value,
+  100 * (actual_points - expected_points) / attempts
+)
+
+knitr::kable(
+  three_season_value[, c(
+    "SEASON_2",
+    "attempts",
+    "actual_points_per_attempt",
+    "expected_points_per_attempt",
+    "points_above_expected_per_100"
+  )],
+  digits = 3,
+  row.names = FALSE,
+  col.names = c(
+    "Season",
+    "Attempts",
+    "Actual Points/Attempt",
+    "Expected Points/Attempt",
+    "Points Above Expected per 100 Attempts"
+  )
+)
+```
+## League Baseline Training on other players 2023-24 evaluating on 2024-25 leaving selected player out
+
+
+```{r three-season-zone-summary}
+three_season_zones <- aggregate(
+  cbind(
+    attempts,
+    actual_makes = made,
+    expected_makes = p_distance,
+    actual_points = points,
+    expected_points
+  ) ~ SEASON_2 + BASIC_ZONE,
+  data = player_three_seasons,
+  FUN = sum
+)
+
+three_season_zones$actual_fg_pct <- with(
+  three_season_zones,
+  100 * actual_makes / attempts
+)
+
+three_season_zones$expected_fg_pct <- with(
+  three_season_zones,
+  100 * expected_makes / attempts
+)
+
+three_season_zones$gap_pp <- with(
+  three_season_zones,
+  actual_fg_pct - expected_fg_pct
+)
+
+three_season_zones$points_above_expected <- with(
+  three_season_zones,
+  actual_points - expected_points
+)
+
+three_season_zones$attempt_share_pct <- with(
+  three_season_zones,
+  100 * attempts /
+    ave(attempts, SEASON_2, FUN = sum)
+)
+
+three_season_zones <- three_season_zones[
+  order(
+    three_season_zones$BASIC_ZONE,
+    three_season_zones$SEASON_2
+  ),
+  ,
+  drop = FALSE
+]
+
+knitr::kable(
+  three_season_zones[, c(
+    "SEASON_2", "BASIC_ZONE", "attempts",
+    "attempt_share_pct", "actual_fg_pct",
+    "expected_fg_pct", "gap_pp",
+    "points_above_expected"
+  )],
+  digits = 2,
+  row.names = FALSE,
+  col.names = c(
+    "Season", "Zone", "Attempts",
+    "Share of Attempts (%)", "Actual FG%",
+    "Expected FG%", "Gap (pp)",
+    "Points Above Expected"
+  )
+)
+```
+
+## Player vs. expected
+
+
+```{r season-shooting-value}
+# Add actual and expected points across each season.
+season_value <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(player_ordinary)),
+    actual_points = player_ordinary$points,
+    expected_points = player_ordinary$expected_points
+  ),
+  by = list(season = player_ordinary$SEASON_2),
+  FUN = sum
+)
+
+# Divide totals by attempts for comparable season averages.
+season_value$actual_points_per_attempt <- (
+  season_value$actual_points / season_value$attempts
+)
+
+season_value$expected_points_per_attempt <- (
+  season_value$expected_points / season_value$attempts
+)
+
+season_value$points_above_expected_per_100 <- (
+  100 * (
+    season_value$actual_points_per_attempt -
+      season_value$expected_points_per_attempt
+  )
+)
+
+knitr::kable(
+  season_value[, c(
+    "season", "attempts",
+    "actual_points_per_attempt",
+    "expected_points_per_attempt",
+    "points_above_expected_per_100"
+  )],
+  digits = 3,
+  col.names = c(
+    "Season", "Attempts",
+    "Actual Points/Attempt",
+    "Expected Points/Attempt",
+    "Points Above Expected per 100 Attempts"
+  )
+)
+```
+
+For every 100 attempts, Wallace scored about 7.15 points above the benchmark in his rookie season and 3.25 below it the following season.
+That separates the observed decline into two parts:
+Actual scoring = Change in expected scoring + Change in performance relative to expectation.
+
+## Scoring change breakdown
+
+
+```{r scoring-change-breakdown}
+# Select each season's summary row.
+earlier_value <- season_value[
+  season_value$season == "2023-24",
+  ,
+  drop = FALSE
+]
+
+later_value <- season_value[
+  season_value$season == "2024-25",
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  nrow(earlier_value) == 1L,
+  nrow(later_value) == 1L
+)
+
+# Change in actual scoring per attempt.
+actual_change <- (
+  later_value$actual_points_per_attempt -
+    earlier_value$actual_points_per_attempt
+)
+
+# Change in the model's expected value of his shot mix.
+expected_change <- (
+  later_value$expected_points_per_attempt -
+    earlier_value$expected_points_per_attempt
+)
+
+# The remaining change is performance relative to expectation.
+relative_change <- actual_change - expected_change
+
+change_breakdown <- data.frame(
+  component = c(
+    "Actual scoring change",
+    "Modeled shot-mix change",
+    "Change relative to expectation"
+  ),
+  points_per_100_attempts = 100 * c(
+    actual_change,
+    expected_change,
+    relative_change
+  )
+)
+
+knitr::kable(change_breakdown, digits = 3)
+```
+
+## Scoring change uncertainty
+
+
+```{r scoring-change-uncertainty}
+# Summarize each game's attempts and scoring.
+game_value <- aggregate(
+  cbind(
+    attempts = rep(1L, nrow(player_ordinary)),
+    actual_points = player_ordinary$points,
+    expected_points = player_ordinary$expected_points
+  ),
+  by = list(
+    season = player_ordinary$SEASON_2,
+    game_id = player_ordinary$GAME_ID
+  ),
+  FUN = sum
+)
+
+earlier_games_value <- game_value[
+  game_value$season == "2023-24", , drop = FALSE
+]
+
+later_games_value <- game_value[
+  game_value$season == "2024-25", , drop = FALSE
+]
+
+# Resample games and calculate scoring per attempt.
+resample_game_value <- function(data) {
+
+  selected <- sample.int(
+    nrow(data),
+    size = nrow(data),
+    replace = TRUE
+  )
+
+  sampled <- data[selected, , drop = FALSE]
+
+  c(
+    actual = sum(sampled$actual_points) /
+      sum(sampled$attempts),
+    expected = sum(sampled$expected_points) /
+      sum(sampled$attempts)
+  )
+}
+
+set.seed(bootstrap_seed)
+
+bootstrap_value_changes <- replicate(bootstrap_repetitions, {
+
+  earlier <- resample_game_value(earlier_games_value)
+  later <- resample_game_value(later_games_value)
+
+  actual_difference <- unname(
+    later["actual"] - earlier["actual"]
+  )
+
+  expected_difference <- unname(
+    later["expected"] - earlier["expected"]
+  )
+
+  100 * c(
+    actual = actual_difference,
+    shot_mix = expected_difference,
+    relative = actual_difference - expected_difference
+  )
+})
+
+# Get the middle 95% of bootstrap changes for each component.
+value_intervals <- t(
+  apply(
+    bootstrap_value_changes,
+    1,
+    quantile,
+    probs = c(0.025, 0.975),
+    names = FALSE
+  )
+)
+
+value_uncertainty <- data.frame(
+  component = change_breakdown$component,
+  observed_change = change_breakdown$points_per_100_attempts,
+  lower_95 = value_intervals[, 1],
+  upper_95 = value_intervals[, 2]
+)
+
+knitr::kable(
+  value_uncertainty,
+  digits = 3,
+  row.names = FALSE,
+  col.names = c(
+    "Component",
+    "Observed Change",
+    "95% Lower",
+    "95% Upper"
+  )
+)
+```
+Wallace’s observed scoring efficiency declined while the modeled value of his shot mix stayed stable. The available sample does not clearly establish a persistent decline in shooting performance.
+
+
+# Data Visualization
+
+
+```{r newest-season-uncertainty}
+# Keep each game's shots together during resampling.
+three_season_games <- aggregate(
+  cbind(
+    attempts,
+    actual_points = points,
+    expected_points
+  ) ~ SEASON_2 + GAME_ID,
+  data = player_three_seasons,
+  FUN = sum
+)
+
+previous_games <- subset(
+  three_season_games,
+  SEASON_2 == "2024-25"
+)
+
+latest_games <- subset(
+  three_season_games,
+  SEASON_2 == "2025-26"
+)
+
+# Calculate the observed scoring values from all attempts.
+season_rates <- function(data) {
+  c(
+    actual = sum(data$actual_points) / sum(data$attempts),
+    expected = sum(data$expected_points) / sum(data$attempts)
+  )
+}
+
+previous_rates <- season_rates(previous_games)
+latest_rates <- season_rates(latest_games)
+
+actual_change <- unname(
+  latest_rates["actual"] - previous_rates["actual"]
+)
+
+expected_change <- unname(
+  latest_rates["expected"] - previous_rates["expected"]
+)
+
+observed_latest_change <- 100 * c(
+  actual = actual_change,
+  shot_mix = expected_change,
+  relative = actual_change - expected_change
+)
+
+# Resample games independently within each season.
+set.seed(bootstrap_seed)
+
+latest_bootstrap <- replicate(bootstrap_repetitions, {
+  previous <- resample_game_value(previous_games)
+  latest <- resample_game_value(latest_games)
+
+  actual_difference <- unname(
+    latest["actual"] - previous["actual"]
+  )
+
+  expected_difference <- unname(
+    latest["expected"] - previous["expected"]
+  )
+
+  100 * c(
+    actual = actual_difference,
+    shot_mix = expected_difference,
+    relative = actual_difference - expected_difference
+  )
+})
+
+latest_intervals <- t(
+  apply(
+    latest_bootstrap,
+    1,
+    quantile,
+    probs = c(0.025, 0.975)
+  )
+)
+
+latest_uncertainty <- data.frame(
+  component = c(
+    "Actual scoring change",
+    "Modeled shot-mix change",
+    "Change relative to expectation"
+  ),
+  observed_change = unname(observed_latest_change),
+  lower_95 = latest_intervals[, 1],
+  upper_95 = latest_intervals[, 2],
+  row.names = NULL
+)
+
+knitr::kable(
+  latest_uncertainty,
+  digits = 3,
+  row.names = FALSE,
+  col.names = c(
+    "Component",
+    "Observed Change",
+    "95% Lower",
+    "95% Upper"
+  ),
+  caption = paste(
+    "2025–26 minus 2024–25:",
+    "points per 100 field-goal attempts"
+  )
+)
+```
+
+
+```{r change-plot, fig.width=8, fig.height=4.5}
+# Reverse the row order so the first component appears at the top.
+plot_data <- value_uncertainty[
+  rev(seq_len(nrow(value_uncertainty))),
+  ,
+  drop = FALSE
+]
+
+positions <- seq_len(nrow(plot_data))
+
+# Create an empty plotting area.
+par(mar = c(5, 8, 5, 2))
+plot(
+  plot_data$observed_change,
+  positions,
+  xlim = range(
+    c(plot_data$lower_95, plot_data$upper_95, 0)
+  ) + c(-2, 2),
+  ylim = c(0.5, nrow(plot_data) + 0.5),
+  yaxt = "n",
+  ylab = "",
+  xlab = "Change in points per 100 field-goal attempts",
+  main = paste0(player_name, ": 2024–25 minus 2023–24"),
+  type = "n"
+)
+
+# Zero represents no change.
+abline(v = 0, lty = 2, col = "gray50")
+
+# Draw the confidence intervals.
+segments(
+  x0 = plot_data$lower_95,
+  y0 = positions,
+  x1 = plot_data$upper_95,
+  y1 = positions,
+  lwd = 3,
+  col = "#0072B2"
+)
+
+# Draw the observed estimates.
+points(
+  plot_data$observed_change,
+  positions,
+  pch = 19,
+  cex = 1.3,
+  col = "#0072B2"
+)
+
+axis(
+  side = 2,
+  at = positions,
+  labels = c(
+    "Relative\nperformance",
+    "Modeled\nshot mix",
+    "Actual\nscoring"
+  ),
+  las = 1,
+  tick = FALSE,
+  cex.axis = 0.85
+)
+
+mtext(
+  "95% game-bootstrap intervals; league model held fixed",
+  side = 3,
+  line = 0.3,
+  cex = 0.8
+)
+```
+
+## Player shot charts
+
+
+```{r player-shot-charts, fig.width=12, fig.height=5.5}
+# Draw court markings in the same coordinates as the shot data.
+draw_half_court <- function() {
+
+  court_color <- "gray65"
+  hoop_y <- 5.25
+
+  # Court boundary, paint, and backboard.
+  rect(-25, 0, 25, 47, border = court_color)
+  rect(-8, 0, 8, 19, border = court_color)
+  segments(-3, 4, 3, 4, col = court_color)
+
+  # Basket.
+  angle <- seq(0, 2 * pi, length.out = 200)
+
+  lines(
+    0.75 * cos(angle),
+    hoop_y + 0.75 * sin(angle),
+    col = "gray30",
+    lwd = 2
+  )
+
+  # Free-throw circle.
+  lines(
+    6 * cos(angle),
+    19 + 6 * sin(angle),
+    col = court_color
+  )
+
+  # Restricted-area semicircle.
+  semicircle <- seq(0, pi, length.out = 150)
+
+  lines(
+    4 * cos(semicircle),
+    hoop_y + 4 * sin(semicircle),
+    col = court_color
+  )
+
+  # Three-point arc and straight corner sections.
+  arc_start <- acos(22 / 23.75)
+  arc_angle <- seq(
+    arc_start,
+    pi - arc_start,
+    length.out = 200
+  )
+
+  join_y <- hoop_y + sqrt(23.75^2 - 22^2)
+
+  segments(
+    c(-22, 22), c(0, 0),
+    c(-22, 22), c(join_y, join_y),
+    col = court_color
+  )
+
+  lines(
+    23.75 * cos(arc_angle),
+    hoop_y + 23.75 * sin(arc_angle),
+    col = court_color
+  )
+}
+
+# Wrap plotting in a function so graphics settings are restored.
+plot_player_shots <- function(data, player_label) {
+
+  previous_settings <- par(no.readonly = TRUE)
+  on.exit(par(previous_settings), add = TRUE)
+
+  seasons <- sort(unique(data$SEASON_2))
+
+  par(
+    mfrow = c(1, length(seasons)),
+    mar = c(3, 1, 3, 1),
+    oma = c(1, 0, 3, 0)
+  )
+
+  for (selected_season in seasons) {
+
+    season_shots <- data[
+      data$SEASON_2 == selected_season,
+      ,
+      drop = FALSE
+    ]
+
+    # Identical scales make all seasons comparable.
+    plot(
+      NA,
+      xlim = c(-27, 27),
+      ylim = c(-2, 47),
+      asp = 1,
+      axes = FALSE,
+      xlab = "",
+      ylab = "",
+      main = paste0(
+        selected_season, " | ",
+        nrow(season_shots), " attempts"
+      )
+    )
+
+    draw_half_court()
+
+    # Plot all attempts in their original locations.
+    points(
+      season_shots$LOC_X,
+      season_shots$LOC_Y,
+      pch = ifelse(season_shots$made == 1, 16, 4),
+      col = ifelse(
+        season_shots$made == 1,
+        adjustcolor("#0072B2", alpha.f = 0.55),
+        adjustcolor("#D55E00", alpha.f = 0.55)
+      ),
+      cex = 0.7
+    )
+
+    legend(
+      "topright",
+      legend = c("Made", "Missed"),
+      pch = c(16, 4),
+      col = c("#0072B2", "#D55E00"),
+      bty = "n",
+      cex = 0.85
+    )
+  }
+
+  mtext(
+    paste0(player_label, ": shot locations by season"),
+    outer = TRUE,
+    side = 3,
+    line = 1,
+    font = 2,
+    cex = 1.2
+  )
+}
+
+plot_player_shots(player_three_seasons, player_name)
+```
+
+The 2024–25 chart shows more activity around the rim and paint, consistent with our zone table. The corner shooting results are harder to compare visually because points overlap—use the percentages and uncertainty intervals for that conclusion.
+One useful distinction: these charts show where he shot; the model evaluates how his results compared with expectations. Together, they tell a clearer story than either alone.
+
+## Zone spacing comparison chart
+
+
+```{r zone-share-chart, fig.width=9, fig.height=6.5}
+plot_zone_shares <- function(data, player_label) {
+
+  # Count attempts for every season–zone combination.
+  attempt_counts <- table(
+    data$SEASON_2,
+    data$BASIC_ZONE
+  )
+
+  # Divide each season's counts by its total attempts.
+  share_matrix <- 100 * prop.table(
+    attempt_counts,
+    margin = 1
+  )
+
+  # Arrange the zones from inside to outside.
+  zone_order <- c(
+    "Restricted Area",
+    "In The Paint (Non-RA)",
+    "Mid-Range",
+    "Left Corner 3",
+    "Right Corner 3",
+    "Above the Break 3"
+  )
+
+  # Keep any additional zones if we reuse this for another player.
+  zone_order <- c(
+    intersect(zone_order, colnames(share_matrix)),
+    setdiff(colnames(share_matrix), zone_order)
+  )
+
+  share_matrix <- share_matrix[
+    ,
+    rev(zone_order),
+    drop = FALSE
+  ]
+
+  # Shorten the longest labels.
+  zone_labels <- colnames(share_matrix)
+  zone_labels[zone_labels == "In The Paint (Non-RA)"] <-
+    "Paint (non-restricted)"
+  zone_labels[zone_labels == "Above the Break 3"] <-
+    "Above-the-break 3"
+
+  # Preserve and restore graphics settings.
+  previous_settings <- par(no.readonly = TRUE)
+  on.exit(par(previous_settings), add = TRUE)
+
+  par(mar = c(5, 11, 4, 2))
+
+  season_colors <- c("#0072B2", "#D55E00", "#009E73")
+
+  bar_positions <- barplot(
+    share_matrix,
+    beside = TRUE,
+    horiz = TRUE,
+    names.arg = zone_labels,
+    las = 1,
+    col = season_colors,
+    border = NA,
+    xlim = c(0, max(share_matrix) + 10),
+    xlab = "Share of season field-goal attempts (%)",
+    main = paste0(player_label, ": shot distribution"),
+    cex.names = 0.85
+  )
+
+  # Label each bar with its percentage.
+  text(
+    x = as.vector(share_matrix) + 0.7,
+    y = as.vector(bar_positions),
+    labels = sprintf("%.1f%%", as.vector(share_matrix)),
+    pos = 4,
+    cex = 0.8
+  )
+
+  legend(
+    "bottomright",
+    legend = rownames(share_matrix),
+    fill = season_colors,
+    border = NA,
+    bty = "n",
+    cex = 0.9
+  )
+}
+
+plot_zone_shares(
+  player_three_seasons,
+  player_name
+)
+```
+
+His shot distribution changed considerably, but the modeled expected points per attempt stayed nearly unchanged. The increased share of paint attempts offset the decreased share of three-point attempts under this benchmark.
+
+## Actual versus expected points per attempt
+
+
+```{r three-season-efficiency-chart, fig.width = 8, fig.height = 5.5}
+plot_season_efficiency <- function(data, player_label) {
+
+  # Put seasons in chronological order.
+  data <- data[order(data$SEASON_2), , drop = FALSE]
+
+  season_positions <- seq_len(nrow(data))
+
+  actual <- data$actual_points_per_attempt
+  expected <- data$expected_points_per_attempt
+
+  # Leave space around the values for labels.
+  y_limits <- range(c(actual, expected)) + c(-0.06, 0.08)
+
+  previous_settings <- par(no.readonly = TRUE)
+  on.exit(par(previous_settings), add = TRUE)
+
+  par(mar = c(5, 5, 5, 2))
+
+  plot(
+    season_positions,
+    actual,
+    type = "n",
+    xaxt = "n",
+    ylim = y_limits,
+    xlab = "Season",
+    ylab = "Points per field-goal attempt",
+    main = paste0(player_label, ": scoring efficiency")
+  )
+
+  axis(
+    side = 1,
+    at = season_positions,
+    labels = data$SEASON_2
+  )
+
+  # Connect actual scoring values.
+  lines(
+    season_positions,
+    actual,
+    type = "b",
+    pch = 16,
+    lwd = 2,
+    col = "#0072B2"
+  )
+
+  # Connect the fixed model's expected scoring values.
+  lines(
+    season_positions,
+    expected,
+    type = "b",
+    pch = 17,
+    lty = 2,
+    lwd = 2,
+    col = "#D55E00"
+  )
+
+  text(
+    season_positions,
+    actual,
+    labels = sprintf("%.3f", actual),
+    pos = 1,
+    col = "#0072B2",
+    cex = 0.85
+  )
+
+  text(
+    season_positions,
+    expected,
+    labels = sprintf("%.3f", expected),
+    pos = 3,
+    col = "#D55E00",
+    cex = 0.85
+  )
+
+  legend(
+    "topright",
+    legend = c("Actual", "Expected: zone + distance"),
+    col = c("#0072B2", "#D55E00"),
+    pch = c(16, 17),
+    lty = c(1, 2),
+    lwd = 2,
+    bty = "n",
+    cex = 0.85
+  )
+
+  mtext(
+    "Same league benchmark applied to each season; free throws excluded",
+    side = 3,
+    line = 0.5,
+    cex = 0.8
+  )
+}
+
+plot_season_efficiency(
+  three_season_value,
+  player_name
+)
+```
+
+
+
+
+
+
+
+
