@@ -1,5 +1,12 @@
 # NBA Player Shot Efficiency
 
+## Interactive player dashboard
+
+**[Open the dashboard folder](dashboard/)** for the searchable player dashboard and instructions. **[Download the standalone HTML](https://github.com/Hclark36/Player-Shot-Efficiency/raw/refs/heads/main/dashboard/index.html)** and open it in a browser. Search player names, switch profiles, select seasons, and download player results as CSV. No R server is required. GitHub's normal file view shows HTML source; download the file to use the dashboard.
+
+The original RMD is unchanged. To rebuild the dashboard in RStudio, run `source("scripts/build_dashboard.R")` from the repository root after installing the packages listed in [dashboard/README.md](dashboard/README.md).
+
+
 An R Markdown project that examines how an NBA player's shot selection and scoring efficiency change across seasons. It compares actual shooting results with a league-wide benchmark to help answer:
 
 **Did a player's efficiency change because of where they shot, or because they made more or fewer shots than expected from those locations?**
